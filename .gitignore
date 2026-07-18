@@ -7,3 +7,10 @@ __pycache__/
 
 # mail channel secret
 scripts/.resend_credentials
+
+# NOTE: render_output/ (above) also covers the automation's generated files:
+#   render_output/.freeze          prep->post handoff marker
+#   render_output/NNNN.clean.md    UI-artifact-stripped render input
+#   render_output/automation.log   scheduled-task run log
+# All local-only, correctly never committed. The task XMLs under
+# scripts/tasks/ ARE tracked on purpose (part of the rebuild recipe).
