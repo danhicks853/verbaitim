@@ -4,3 +4,6 @@ scratch/
 render_output/
 scripts/.bluesky_credentials
 __pycache__/
+
+# mail channel secret
+scripts/.resend_credentials
