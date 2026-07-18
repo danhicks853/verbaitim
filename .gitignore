@@ -3,3 +3,4 @@ scratch/
 *raw.txt
 render_output/
 scripts/.bluesky_credentials
+__pycache__/
