@@ -11,10 +11,12 @@ and rejected as "reads fake").
 No browser dependency on purpose -- Pillow + bundled fonts, so this runs
 the same way in any fresh sandbox without needing a ~300MB headless-Chromium
 install. Supports the narrow markdown vocabulary actually used in bits/:
-**bold**, *italic*, `code`, "- " bullets, and a "*(aside)*" meta line.
+**bold**, *italic*, `code`, "- " bullets.
 
-Known limitation: no color-emoji font is bundled yet, so emoji are stripped
-rather than rendered as tofu boxes. Revisit if/when a font file is sourced.
+Color emoji render via the bundled NotoColorEmoji.ttf (CBDT/CBLC bitmap
+format specifically -- the newer COLR/SVG vector Noto build Pillow's
+embedded_color does not render in this environment; tested, confirmed
+blank output). Single 109px bitmap strike, scaled to line size.
 
 Usage:
     python3 render_bit.py path/to/bits/0015-grandpa-c-pants.md output/0015.png
@@ -36,13 +38,11 @@ BG_CARD = (25, 26, 30)
 BUBBLE_BG = (43, 44, 49)
 BUBBLE_TEXT = (242, 242, 240)
 CLAUDE_TEXT = (233, 233, 231)
-META_TEXT = (130, 130, 138)
 TAG_TEXT = (85, 85, 92)
 CODE_BG = (52, 53, 58)
 
 BUBBLE_SIZE = 30
 CLAUDE_SIZE = 32
-META_SIZE = 22
 TAG_SIZE = 22
 LINE_GAP = 1.5
 
@@ -57,6 +57,8 @@ FONTS = {
     ("serif", True, True): os.path.join(FONT_DIR, "DejaVuSerif-BoldItalic.ttf"),
     ("mono", False, False): os.path.join(FONT_DIR, "DejaVuSansMono.ttf"),
 }
+EMOJI_FONT_PATH = os.path.join(FONT_DIR, "NotoColorEmoji.ttf")
+EMOJI_NATIVE_PX = 109  # font's single bitmap strike size
 
 _font_cache = {}
 
@@ -69,12 +71,57 @@ def get_font(family, size, bold=False, italic=False):
     return _font_cache[key]
 
 
-def strip_emoji(text):
-    return re.sub(
-        "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]+",
-        "",
-        text,
-    )
+def get_emoji_font():
+    key = ("emoji", EMOJI_NATIVE_PX)
+    if key not in _font_cache:
+        # CBDT/CBLC bitmap fonts only have one strike (109px here) -- Pillow
+        # raises OSError("invalid pixel size") for any other requested size.
+        # So we always render at native size onto a scratch canvas, then
+        # resize the result down to match the surrounding text size.
+        _font_cache[key] = ImageFont.truetype(EMOJI_FONT_PATH, EMOJI_NATIVE_PX)
+    return _font_cache[key]
+
+
+_emoji_glyph_cache = {}
+
+
+def render_emoji_glyph(word, target_px):
+    """Render `word` (one or more emoji codepoints) at native strike size on
+    a transparent scratch canvas, crop to content, then downscale to roughly
+    match the surrounding text's line size. Returns (PIL.Image, display_w)."""
+    key = (word, target_px)
+    if key in _emoji_glyph_cache:
+        return _emoji_glyph_cache[key]
+
+    font = get_emoji_font()
+    scratch = Image.new("RGBA", (EMOJI_NATIVE_PX * max(1, len(word)) + 20, EMOJI_NATIVE_PX + 20), (0, 0, 0, 0))
+    d = ImageDraw.Draw(scratch)
+    d.text((0, 0), word, font=font, embedded_color=True)
+    bbox = scratch.getbbox()
+    if bbox is None:
+        result = (Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0)
+        _emoji_glyph_cache[key] = result
+        return result
+    cropped = scratch.crop(bbox)
+    # target visual height ~= 1.05x the surrounding font size (optically
+    # matches cap-height better than 1:1 for this particular emoji font)
+    target_h = int(target_px * 1.05)
+    scale = target_h / cropped.height
+    target_w = max(1, int(cropped.width * scale))
+    resized = cropped.resize((target_w, target_h), Image.LANCZOS)
+    result = (resized, target_w)
+    _emoji_glyph_cache[key] = result
+    return result
+
+
+EMOJI_CHAR_RE = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\U0000FE0F\U0000200D]"
+)
+
+
+def is_emoji_word(w):
+    stripped = w.strip("\U0000FE0F\U0000200D")
+    return len(stripped) > 0 and all(EMOJI_CHAR_RE.match(ch) for ch in stripped)
 
 
 TURN_RE = re.compile(r"^\*\*(Dan|Claude):\*\*\s*", re.MULTILINE)
@@ -129,51 +176,63 @@ def split_blocks(text):
     return blocks
 
 
+# Word tuple shape used throughout: (text, bold, italic, code, emoji)
+
 def wrap_runs(runs, family, size, color, max_width, draw, bold_all=False):
     words = []
     for text, bold, italic, code in runs:
         for w in text.split(" "):
             if w == "":
                 continue
-            # Glue pure-punctuation tokens onto the previous word instead of
-            # inserting a space -- happens when a styled run (bold/italic/code)
-            # ends right where trailing punctuation begins in the source,
-            # e.g. "*safety*." parses as an italic run "safety" immediately
-            # followed by a plain run ".", with no space in between.
-            if words and re.match(r"^[.,!?;:)\]}’'\u201d]+$", w):
-                prev_w, prev_b, prev_i, prev_c = words[-1]
-                words[-1] = (prev_w + w, prev_b, prev_i, prev_c)
-            else:
-                words.append((w, bold or bold_all, italic, code))
+            emoji = is_emoji_word(w)
+            if words and not emoji and re.match(r"^[.,!?;:)\]}’'”]+$", w):
+                prev_w, prev_b, prev_i, prev_c, prev_e = words[-1]
+                if not prev_e:
+                    words[-1] = (prev_w + w, prev_b, prev_i, prev_c, prev_e)
+                    continue
+            words.append((w, bold or bold_all, italic, code, emoji))
 
     lines = []
     current = []
     current_width = 0
     space_w = draw.textlength(" ", font=get_font(family, size))
 
-    for w, bold, italic, code in words:
-        fam = "mono" if code else family
-        fsize = int(size * 0.88) if code else size
-        font = get_font(fam, fsize, bold, italic)
-        w_width = draw.textlength(w, font=font)
+    for w, bold, italic, code, emoji in words:
+        if emoji:
+            font = None
+            _, w_width = render_emoji_glyph(w, size)
+        else:
+            fam = "mono" if code else family
+            fsize = int(size * 0.88) if code else size
+            font = get_font(fam, fsize, bold, italic)
+            w_width = draw.textlength(w, font=font)
         extra = space_w if current else 0
         if current and current_width + extra + w_width > max_width:
             lines.append(current)
             current = []
             current_width = 0
             extra = 0
-        current.append((w, font, color, code))
+        current.append((w, font, color, code, emoji, w_width))
         current_width += extra + w_width
     if current:
         lines.append(current)
     return lines
 
 
+def draw_token(img, draw, x, y, w, font, color, emoji, size, line_h):
+    if emoji:
+        glyph_img, glyph_w = render_emoji_glyph(w, size)
+        # vertically center the glyph within the line box
+        gy = int(y + (line_h - glyph_img.height) / 2)
+        img.paste(glyph_img, (int(x), gy), glyph_img)
+    else:
+        draw.text((x, y), w, font=font, fill=color)
+
+
 def render(bit_path, out_path, tag=None):
     with open(bit_path, encoding="utf-8") as f:
         raw = f.read()
 
-    raw = strip_emoji(raw)
     turns = parse_turns(raw)
     if not turns:
         raise ValueError(f"No turns found in {bit_path}")
@@ -221,7 +280,7 @@ def render(bit_path, out_path, tag=None):
 
     y_cursor += 30
     canvas_h = y_cursor + PAD
-    img = Image.new("RGB", (CANVAS_W, canvas_h), (255, 255, 255))
+    img = Image.new("RGBA", (CANVAS_W, canvas_h), (255, 255, 255, 255))
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle(
         [PAD - 20, PAD - 20, CANVAS_W - PAD + 20, canvas_h - PAD + 20],
@@ -233,9 +292,9 @@ def render(bit_path, out_path, tag=None):
         if block["type"] == "bubble":
             lines = block["lines"]
             line_h = BUBBLE_SIZE * LINE_GAP
+            space_w = draw.textlength(" ", font=get_font("sans", BUBBLE_SIZE))
             text_block_w = max(
-                (sum(draw.textlength(w, font=fnt) for w, fnt, c, code in ln)
-                 + draw.textlength(" ", font=get_font("sans", BUBBLE_SIZE)) * max(0, len(ln) - 1))
+                (sum(w for *_, w in ln) + space_w * max(0, len(ln) - 1))
                 for ln in lines
             ) if lines else 0
             bubble_w = min(bubble_max_w, text_block_w + 28)
@@ -247,12 +306,11 @@ def render(bit_path, out_path, tag=None):
             draw.rounded_rectangle([bx0, by0, bx1, by1], radius=18, fill=BUBBLE_BG)
             ly = by0 + 10
             for ln in lines:
-                lw = sum(draw.textlength(w, font=fnt) for w, fnt, c, code in ln)
-                lw += draw.textlength(" ", font=get_font("sans", BUBBLE_SIZE)) * max(0, len(ln) - 1)
+                lw = sum(w for *_, w in ln) + space_w * max(0, len(ln) - 1)
                 lx = bx1 - 14 - lw
-                for w, fnt, c, code in ln:
-                    draw.text((lx, ly), w, font=fnt, fill=c)
-                    lx += draw.textlength(w, font=fnt) + draw.textlength(" ", font=get_font("sans", BUBBLE_SIZE))
+                for w, fnt, c, code, emoji, adv in ln:
+                    draw_token(img, draw, lx, ly, w, fnt, c, emoji, BUBBLE_SIZE, line_h)
+                    lx += adv + space_w
                 ly += line_h
             cy += bubble_h + 4
 
@@ -260,6 +318,7 @@ def render(bit_path, out_path, tag=None):
             lines = block["lines"]
             size = CLAUDE_SIZE
             line_h = size * LINE_GAP
+            space_w = draw.textlength(" ", font=get_font("serif", size))
             x0 = PAD + CARD_PAD + block["indent"]
             if block["type"] == "claude_bullet":
                 draw.ellipse(
@@ -269,12 +328,11 @@ def render(bit_path, out_path, tag=None):
             ly = cy
             for ln in lines:
                 lx = x0
-                for w, fnt, c, code in ln:
+                for w, fnt, c, code, emoji, adv in ln:
                     if code:
-                        cw = draw.textlength(w, font=fnt)
-                        draw.rounded_rectangle([lx - 4, ly + 2, lx + cw + 4, ly + line_h - 6], radius=5, fill=CODE_BG)
-                    draw.text((lx, ly), w, font=fnt, fill=c)
-                    lx += draw.textlength(w, font=fnt) + draw.textlength(" ", font=get_font("serif", size))
+                        draw.rounded_rectangle([lx - 4, ly + 2, lx + adv + 4, ly + line_h - 6], radius=5, fill=CODE_BG)
+                    draw_token(img, draw, lx, ly, w, fnt, c, emoji, size, line_h)
+                    lx += adv + space_w
                 ly += line_h
             cy += int(len(lines) * line_h) + 10
 
@@ -282,7 +340,7 @@ def render(bit_path, out_path, tag=None):
     tw = draw.textlength(tag, font=tag_font)
     draw.text((CANVAS_W - PAD - CARD_PAD - tw, canvas_h - PAD - 10), tag, font=tag_font, fill=TAG_TEXT)
 
-    img.save(out_path)
+    img.convert("RGB").save(out_path)
     return out_path
 
 
