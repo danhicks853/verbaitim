@@ -161,6 +161,7 @@ def send_mail(subject, body, creds=None):
         headers={
             "Authorization": f"Bearer {creds['RESEND_API_KEY']}",
             "Content-Type": "application/json",
+            "User-Agent": "VerbAItim/1.0 (+https://bsky.app/profile/readverbaitim.bsky.social)",
         },
     )
     try:
