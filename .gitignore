@@ -1,3 +1,5 @@
 raw/
 scratch/
-*raw.txtrender_output/
+*raw.txt
+render_output/
+scripts/.bluesky_credentials
